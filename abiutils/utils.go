@@ -16,29 +16,34 @@ import (
 	"strings"
 )
 
-// Solidity的数据类型
+// 用于描述Solidity数据类型的结构体
 type SolidityDataType struct {
-	Name     string `json:"name"`
-	Type     Kind   `json:"type"`
-	IsNumber bool   `json:"isNumber"` //是否数字
-	BitSize  int    `json:"bitSize"`  //以bit为单位的长度，用于以后补0，仅对值类型生效
+	Name     string `json:"name"`     // 类型名，如：int32
+	Type     Kind   `json:"type"`     // 值类型或引用类型
+	IsNumber bool   `json:"isNumber"` // 是否数字
+	IsArray  bool   `json:"isArray"`  // 是否数组
+	BitSize  int    `json:"bitSize"`  // 以bit为单位的长度，用于以后补0，仅对值类型生效
 }
 
 type SolidityDataTypes []*SolidityDataType
 
+// 用于封装Transaction中Data字节数组的结构体
 type InputData struct {
-	Param     SolidityDataType `json:"-"`         //参数数据类型
+	Param     SolidityDataType `json:"-"`         //参数的数据类型
 	ParamName string           `json:"paramName"` //参数名
-	Offset    int64            `json:"-"`         //偏移量
+	Offset    int64            `json:"-"`         //偏移量，非值类型时为0
 	Data      string           `json:"data"`      //数据内容
 }
 
 type InputDatas []InputData
+
+// 用于描述Solidity函数的结构体
 type SolidityMethod struct {
-	Name       string     `json:"name"`
+	Name       string     `json:"name"` // 方法标识，如：function foo(uint id, string name)
 	InputDatas InputDatas `json:"params"`
 }
 
+// 数据类型的类型
 type Kind int
 
 const (
@@ -61,20 +66,32 @@ const (
 )
 
 // 通过参数类型获得相关信息
-// uint : uint,value,256  =》 uint类型，值类型，256位
-// string : string,variable,0  =》 string类型，非值类型，无意义
+//name = "uint"	=>	returns { uint, value, 256 }		// uint类型，值类型，256位
+//name = "string"	=>	returns { string, variable, 0 }		// string类型，非值类型，无意义
+//name = "byte3[10]"	=>	returns { bytes3[10], value, 0}	// bytes3数组类型，值类型，3*8*10=240位
 func GetSolidityTypeByName(name string) *SolidityDataType {
 	var bitSize = 0
 	var typeName = VALUE
 	var isNumber = false
-	if name == BOOL {
-		bitSize = 1
+	var isArray = false
+	if name == BOOL { // bool
+		bitSize = 8
 	} else if name == ADDRESS {
-		bitSize = 20
+		bitSize = 20 * 8
 	} else if strings.Contains(name, UINT) {
 		isNumber = true
-		if len(name) == len(UINT) { //uint
+		if len(name) == len(UINT) { // uint
 			bitSize = 256
+		} else if strings.Contains(name, "[") { //uint<M>[N]
+			isArray = true
+			base := 256
+			left := strings.Index(name, "[")
+			right := strings.Index(name, "]")
+			length := cast.ToInt(name[left+1 : right]) // N
+			if left > len(UINT) {                      //uint<M>[N]
+				base = cast.ToInt(name[len(UINT):left]) // M
+			}
+			bitSize = base * length //M == 0 , uint[N]
 		} else {
 			bitSize = cast.ToInt(strings.Trim(name, UINT))
 		}
@@ -82,25 +99,43 @@ func GetSolidityTypeByName(name string) *SolidityDataType {
 		isNumber = true
 		if len(name) == len(INT) { //int
 			bitSize = 256
+		} else if strings.Contains(name, "[") { //int[]
+			isArray = true
+			base := 256
+			left := strings.Index(name, "[")
+			right := strings.Index(name, "]")
+			length := cast.ToInt(name[left+1 : right]) // N
+			if left > len(INT) {                       //int<M>
+				base = cast.ToInt(name[len(INT):left]) // M
+			}
+			bitSize = base * length //M == 0 , int[N]
 		} else {
 			bitSize = cast.ToInt(strings.Trim(name, INT))
 		}
 	} else if strings.Contains(name, BYTES) {
 		if len(name) == len(BYTES) { //bytes非值类型
 			typeName = VARIABLE
+		} else if strings.Contains(name, "[") { //bytes[]
+			isArray = true
+			base := 1
+			left := strings.Index(name, "[")
+			right := strings.Index(name, "]")
+			length := cast.ToInt(name[left+1 : right]) // N
+			if left > len(BYTES) {                     //bytes<M>
+				base = cast.ToInt(name[len(BYTES):left]) // M
+			}
+			bitSize = 8 * base * length //M == 0 , bytes[N]
 		} else {
 			bitSize = 8 * cast.ToInt(strings.Trim(name, BYTES))
 		}
 	} else if name == STRING {
-		typeName = VARIABLE
-	} else if strings.HasSuffix(name, "[]") {
 		typeName = VARIABLE
 	} else {
 		bitSize = 0
 		typeName = VALUE
 		name = ""
 	}
-	return &SolidityDataType{name, typeName, isNumber, bitSize}
+	return &SolidityDataType{name, typeName, isNumber, isArray, bitSize}
 }
 
 // 十六进制转换为十进制
@@ -160,7 +195,7 @@ func unmarshalInput(args abi.Arguments, input []byte) (InputDatas, error) {
 		inputData.ParamName = arg.Name
 		inputData.Offset = 0
 		if dataType.Type == VALUE { //值类型
-			inputData.Data = TrimLeadingZero(hexutil.Encode(input[next : next+bitSize]))
+			inputData.Data = hexutil.Encode(input[next : next+bitSize])
 			if dataType.IsNumber {
 				dataInt, err := DecodeBigFromHex(inputData.Data)
 				if err != nil {
@@ -169,6 +204,7 @@ func unmarshalInput(args abi.Arguments, input []byte) (InputDatas, error) {
 				inputData.Data = config.ToString(dataInt)
 			}
 		} else { //动态类型
+
 			offsetHex := hexutil.Encode(input[next : next+bitSize])
 			offsetInt, err := DecodeBigFromHex(offsetHex)
 			if err != nil {
