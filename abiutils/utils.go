@@ -4,7 +4,7 @@
  * solidity-utils
  */
 
-package solidity_utils
+package abiutils
 
 import (
 	"github.com/astaxie/beego/config"
